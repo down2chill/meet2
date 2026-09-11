@@ -1,0 +1,16 @@
+{
+  "name": "Down2Chill Meet",
+  "short_name": "Meet",
+  "description": "Video rooms for Down2Chill. Enter your meeting code and join.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#06142e",
+  "theme_color": "#06142e",
+  "icons": [
+    { "src": "/brand/favicon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/brand/favicon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/brand/favicon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

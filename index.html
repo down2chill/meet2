@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+    <title>Down2Chill Meet</title>
+    <meta name="description" content="Video rooms for Down2Chill. Enter your meeting code and join." />
+    <!-- Meeting codes should never turn up in a search result. Unfurlers read
+         the og: tags below regardless, so a shared link still previews. -->
+    <meta name="robots" content="noindex" />
+    <meta name="theme-color" content="#06142e" />
+    <meta name="apple-mobile-web-app-title" content="Meet" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+    <!-- /favicon.ico is requested by browsers whether it is linked or not, and
+         by plenty of link unfurlers too, so the file sits at the web root and
+         is not only referenced here. -->
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" type="image/png" sizes="48x48" href="/brand/favicon-48.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/brand/favicon-192.png" />
+    <link rel="apple-touch-icon" href="/brand/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+
+    <!-- Share card defaults. The Worker rewrites these on /j/<code> responses
+         (meeting title, schedule, a live /og/<code>.png card), which does put
+         the title and code in link-preview caches — the trade for real
+         per-session cards. Every other route serves them as-is. -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Down2Chill" />
+    <meta property="og:title" content="Down2Chill Meet" />
+    <meta property="og:description" content="You have been invited to a Down2Chill video room. Open the link to join." />
+    <meta property="og:url" content="https://meet.down2chill.com/" />
+    <meta property="og:image" content="https://meet.down2chill.com/brand/social-1200.jpg" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Down2Chill" />
+    <meta property="og:locale" content="en_US" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Down2Chill Meet" />
+    <meta name="twitter:description" content="You have been invited to a Down2Chill video room. Open the link to join." />
+    <meta name="twitter:image" content="https://meet.down2chill.com/brand/social-1200.jpg" />
+
+    <!--
+      The three hosts every join talks to. Opening the TCP + TLS connections
+      while the page is still rendering takes that handshake off the critical
+      path once the user clicks Join.
+
+      socket-edge carries the meeting WebSocket and used to be dns-prefetch
+      only, which resolves the name but leaves the TLS handshake on the join.
+      That is the slowest part of a cold first load, and Safari feels it most.
+      No crossorigin attribute here on purpose: the connection is used by a
+      WebSocket, not by a CORS fetch, so an anonymous-mode socket would warm
+      the wrong pool.
+    -->
+    <link rel="preconnect" href="https://api.realtime.cloudflare.com" crossorigin />
+    <link rel="preconnect" href="https://location.realtime.cloudflare.com" crossorigin />
+    <link rel="preconnect" href="https://socket-edge.realtime.cloudflare.com" />
+
+    <!-- All three faces are used above the fold on every screen. -->
+    <link rel="preload" href="/brand/fonts/montserrat-var.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/brand/fonts/dm-mono-500.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/brand/fonts/dm-mono-400.woff2" as="font" type="font/woff2" crossorigin />
+
+    <style>
+      /* Just enough to paint the right colour before theme.css arrives. */
+      html,
+      body,
+      #root {
+        margin: 0;
+        height: 100%;
+        color: #fff;
+        font-family: "Montserrat", ui-sans-serif, system-ui, sans-serif;
+      }
+      /* on <html> only: body carries the gradient layer and must stay clear */
+      html {
+        background: #06142e;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

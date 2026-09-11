@@ -1,0 +1,6 @@
+# Every page also sends `noindex`, so nothing here should reach a search
+# result. Crawlers are not blocked outright on purpose: link unfurlers read
+# robots.txt too, and a shared meeting link should still show its preview card.
+User-agent: *
+Disallow: /admin
+Allow: /

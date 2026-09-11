@@ -1,0 +1,47 @@
+{
+  "name": "video",
+  "main": "worker/index.js",
+  "compatibility_date": "2026-09-01",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "ROOMS",
+      "id": "d640bbcd1f7344dd9680917d315110e3"
+    }
+  ],
+  // Abuse ceiling on the two routes that spend money: creating a meeting hits
+  // the Cloudflare API and writes to KV, joining mints a token. namespace_id is
+  // just a local label, you do not create these anywhere in the dashboard.
+  // The Worker degrades gracefully if you remove this block: it keeps working,
+  // it simply stops rate limiting.
+  "ratelimits": [
+    {
+      "name": "CREATE_LIMIT",
+      "namespace_id": "1001",
+      "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      "name": "JOIN_LIMIT",
+      "namespace_id": "1002",
+      "simple": { "limit": 20, "period": 60 }
+    },
+    {
+      "name": "LOGIN_LIMIT",
+      "namespace_id": "1003",
+      "simple": { "limit": 8, "period": 60 }
+    }
+  ],
+  // Once a day: switch off meetings still ACTIVE on Cloudflare whose record here
+  // has expired (30 days after anyone last joined). See sweepOrphans().
+  "triggers": {
+    "crons": ["17 4 * * *"]
+  },
+  "vars": {
+    "CF_ACCOUNT_ID": "2de330a9a4dd9cd86ace3de5b9c4556a",
+    "RTK_APP_ID": "0f61251a-7a13-46b6-89f3-cc2556af1864"
+  }
+}
