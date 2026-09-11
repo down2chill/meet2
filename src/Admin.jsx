@@ -222,7 +222,7 @@ function Create({ onCreated }) {
           onChange={(e) => setTitle(e.target.value)}
         />
         <label className="field-label">
-          Session date &amp; time (optional) — shown on the link&apos;s share card
+          Session date &amp; time (optional) - shown on the link&apos;s share card
         </label>
         <input
           className="field"
@@ -438,7 +438,7 @@ function Edit({ m, onSaved }) {
       />
 
       <label className="field-label">
-        Session date &amp; time — blank removes it from the share card
+        Session date &amp; time - blank removes it from the share card
       </label>
       <input
         className="field"

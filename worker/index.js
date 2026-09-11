@@ -19,7 +19,7 @@
  * whose record here has expired -- 30 days after anyone last joined.
  *
  *   GET  /api/debug                 bindings + presets (needs ADMIN_KEY secret)
- *   GET  /og/<code>.png             live share card (title + schedule), cached
+ *   GET  /og/<code>.<ver>.jpg       live share card (title + schedule), cached
  *   *                               static assets from the ASSETS binding
  *
  * /j/<code> shells get their og:/twitter: tags personalised on the way out,
@@ -27,6 +27,13 @@
  */
 
 import { ImageResponse } from "workers-og";
+import UPNG from "upng-js";
+import jpeg from "jpeg-js";
+
+// jpeg-js hands its bytes back through Node's Buffer; workerd has none, and
+// the only method touched on the encode path is covered by a Uint8Array.
+if (typeof globalThis.Buffer === "undefined")
+  globalThis.Buffer = { from: (a) => new Uint8Array(a) };
 
 const CF_API = "https://api.cloudflare.com/client/v4/accounts";
 
@@ -69,7 +76,11 @@ const UPSTREAM_TIMEOUT = 10000;
 // Share cards. CARD_REV busts every cached card after a design change; the
 // rest of the version hash comes from the record (title / schedule), so an
 // edited meeting is a brand-new image URL to crawlers that cached the old one.
-const CARD_REV = 1;
+const CARD_REV = 2;
+// WhatsApp silently drops preview images much over ~300 KB (Telegram and
+// Facebook allow megabytes), so the card ships as JPEG at this quality —
+// the photo band lands near 200 KB where the same pixels as PNG were 650 KB.
+const CARD_JPEG_Q = 82;
 const MAX_TZ = 40; // IANA zone names top out around 30 chars
 const TZ_RE = /^[A-Za-z0-9_+\-/]{1,40}$/;
 // Schedules must be real epoch-ms timestamps this side of 2100.
@@ -587,7 +598,7 @@ async function personaliseShell(request, env, res) {
 
   const origin = new URL(request.url).origin;
   const title = room.title || "Meeting";
-  const img = origin + "/og/" + code + ".png?v=" + (await cardVersion(room));
+  const img = origin + "/og/" + code + "." + (await cardVersion(room)) + ".jpg";
   const desc =
     (room.when ? formatWhen(room.when, room.tz) + ". " : "") +
     "You have been invited to a Down2Chill video room. Open the link to join.";
@@ -597,7 +608,7 @@ async function personaliseShell(request, env, res) {
     "og:description": desc,
     "og:url": origin + "/j/" + code,
     "og:image": img,
-    "og:image:alt": title + " — Down2Chill Meet",
+    "og:image:alt": title + " - Down2Chill Meet",
     "twitter:title": title,
     "twitter:description": desc,
     "twitter:image": img,
@@ -613,20 +624,27 @@ async function personaliseShell(request, env, res) {
 
 /* ---------------------------- share cards ---------------------------- */
 
-// GET /og/<code>.png — the meeting's share card, rendered on demand (satori +
-// resvg via workers-og) and never stored: the edge cache absorbs repeats. The
-// cache key carries a version computed from the record, not the query string,
-// so made-up ?v= values cannot force re-renders, while a real edit (new title
-// or time) is a new URL to crawlers and a new key here.
+// GET /og/<code>.<version>.jpg — the meeting's share card, rendered on demand
+// (satori + resvg via workers-og, then JPEG) and never stored: the edge cache
+// absorbs repeats. The version lives in the path, not a query string (some
+// WhatsApp clients choke on queries in og:image), and the server recomputes it
+// from the record: stale or made-up versions redirect to the canonical URL, so
+// the cache only ever holds one entry per meeting and probing cannot force
+// re-renders, while a real edit (new title or time) is a new URL to crawlers.
 async function shareCard(request, env, ctx, rest) {
-  const code = rest.replace(/\.png$/, "");
-  if (!CODE_RE.test(code)) return json({ error: "Not found" }, 404);
+  const m = rest.match(/^([^.]+?)(?:\.([0-9a-f]{8,16}))?\.(?:png|jpe?g)$/);
+  if (!m || !CODE_RE.test(m[1])) return json({ error: "Not found" }, 404);
+  const code = m[1];
 
   const room = await env.ROOMS.get("room:" + code, { type: "json", cacheTtl: KV_CACHE_TTL });
   // Unknown or expired: hand crawlers the generic brand image instead of a 404.
   if (!room) return Response.redirect(new URL("/brand/social-1200.jpg", request.url), 302);
 
-  const key = new Request(new URL("/og/" + code + ".png?v=" + (await cardVersion(room)), request.url));
+  const ver = await cardVersion(room);
+  const canonical = new URL("/og/" + code + "." + ver + ".jpg", request.url);
+  if (m[2] !== ver) return Response.redirect(canonical, 302);
+
+  const key = new Request(canonical);
   let res = await caches.default.match(key);
   if (!res) {
     res = await renderCard(env, room);
@@ -695,7 +713,7 @@ async function renderCard(env, room) {
   <div style="display:flex;flex-direction:column;width:1200px;height:630px;position:relative;font-family:Montserrat;background:linear-gradient(145deg,#06142e 0%,#0c2450 38%,#123b79 68%,#0e4d87 100%)">
     <div style="display:flex;position:absolute;top:-320px;left:280px;width:760px;height:640px;background:radial-gradient(circle,rgba(80,64,198,0.55) 0%,rgba(80,64,198,0) 65%)"></div>
     <div style="display:flex;flex-direction:column;justify-content:center;flex-grow:1;padding:0 64px">
-      <div style="display:flex;font-family:'DM Mono';font-size:21px;font-weight:500;letter-spacing:3px;color:#dffcff">DOWN2CHILL MEET — YOU'RE INVITED</div>
+      <div style="display:flex;font-family:'DM Mono';font-size:21px;font-weight:500;letter-spacing:3px;color:#dffcff">DOWN2CHILL MEET - YOU'RE INVITED</div>
       <div style="display:flex;margin-top:26px;font-size:${size}px;font-weight:800;line-height:1.05;letter-spacing:${-Math.round(size / 28)}px;color:#ffffff">${esc(title)}</div>
       ${when ? `
       <div style="display:flex;align-items:center;margin-top:30px">
@@ -711,9 +729,14 @@ async function renderCard(env, room) {
   </div>`;
 
   const img = new ImageResponse(html, { width: 1200, height: 630, fonts: assets.fonts });
-  return new Response(img.body, {
+  // resvg only speaks PNG; decode it and re-encode as JPEG so WhatsApp-sized
+  // limits are met. The buffered body also gives crawlers a Content-Length.
+  const png = UPNG.decode(await img.arrayBuffer());
+  const rgba = new Uint8Array(UPNG.toRGBA8(png)[0]);
+  const out = jpeg.encode({ data: rgba, width: png.width, height: png.height }, CARD_JPEG_Q).data;
+  return new Response(out, {
     headers: {
-      "Content-Type": "image/png",
+      "Content-Type": "image/jpeg",
       // A day for crawlers; immutable is honest because edits change the URL.
       "Cache-Control": "public, max-age=86400, immutable",
       "X-Robots-Tag": "noindex",
