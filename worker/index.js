@@ -20,6 +20,7 @@
  *
  *   GET  /api/debug                 bindings + presets (needs ADMIN_KEY secret)
  *   GET  /og/<code>.<ver>.jpg       live share card (title + schedule), cached
+ *   GET  /og/<code>.<ver>.mp4       the same card as a short animated loop
  *   *                               static assets from the ASSETS binding
  *
  * /j/<code> shells get their og:/twitter: tags personalised on the way out,
@@ -29,6 +30,8 @@
 import { ImageResponse } from "workers-og";
 import UPNG from "upng-js";
 import jpeg from "jpeg-js";
+import "./vendor/h264-wasm.js";
+import hme from "./vendor/h264.cjs";
 
 // jpeg-js hands its bytes back through Node's Buffer; workerd has none, and
 // the only method touched on the encode path is covered by a Uint8Array.
@@ -76,11 +79,15 @@ const UPSTREAM_TIMEOUT = 10000;
 // Share cards. CARD_REV busts every cached card after a design change; the
 // rest of the version hash comes from the record (title / schedule), so an
 // edited meeting is a brand-new image URL to crawlers that cached the old one.
-const CARD_REV = 2;
+const CARD_REV = 3;
 // WhatsApp silently drops preview images much over ~300 KB (Telegram and
 // Facebook allow megabytes), so the card ships as JPEG at this quality —
 // the photo band lands near 200 KB where the same pixels as PNG were 650 KB.
 const CARD_JPEG_Q = 82;
+// The og:video variant of the card: a short seamless loop of the card pixels
+// with scripted effects, H.264-encoded in-worker. Platforms that ignore
+// og:video (WhatsApp, iMessage) fall back to the og:image JPEG.
+const VID = { w: 640, h: 336, fps: 12, frames: 42, qp: 28 };
 const MAX_TZ = 40; // IANA zone names top out around 30 chars
 const TZ_RE = /^[A-Za-z0-9_+\-/]{1,40}$/;
 // Schedules must be real epoch-ms timestamps this side of 2100.
@@ -598,7 +605,8 @@ async function personaliseShell(request, env, res) {
 
   const origin = new URL(request.url).origin;
   const title = room.title || "Meeting";
-  const img = origin + "/og/" + code + "." + (await cardVersion(room)) + ".jpg";
+  const ver = await cardVersion(room);
+  const img = origin + "/og/" + code + "." + ver + ".jpg";
   const desc =
     (room.when ? formatWhen(room.when, room.tz) + ". " : "") +
     "You have been invited to a Down2Chill video room. Open the link to join.";
@@ -619,35 +627,51 @@ async function personaliseShell(request, env, res) {
     rw.on(`meta[property="${k}"]`, put);
     rw.on(`meta[name="${k}"]`, put);
   }
+  // The shell carries no og:video tags to rewrite, so the animated card is
+  // appended here. Platforms that ignore it keep using og:image above.
+  const vid = origin + "/og/" + code + "." + ver + ".mp4";
+  rw.on("head", {
+    element: (e) =>
+      e.append(
+        `<meta property="og:video" content="${vid}" />` +
+          `<meta property="og:video:secure_url" content="${vid}" />` +
+          `<meta property="og:video:type" content="video/mp4" />` +
+          `<meta property="og:video:width" content="${VID.w}" />` +
+          `<meta property="og:video:height" content="${VID.h}" />`,
+        { html: true }
+      ),
+  });
   return rw.transform(res);
 }
 
 /* ---------------------------- share cards ---------------------------- */
 
-// GET /og/<code>.<version>.jpg — the meeting's share card, rendered on demand
-// (satori + resvg via workers-og, then JPEG) and never stored: the edge cache
-// absorbs repeats. The version lives in the path, not a query string (some
-// WhatsApp clients choke on queries in og:image), and the server recomputes it
-// from the record: stale or made-up versions redirect to the canonical URL, so
-// the cache only ever holds one entry per meeting and probing cannot force
-// re-renders, while a real edit (new title or time) is a new URL to crawlers.
+// GET /og/<code>.<version>.jpg|.mp4 — the meeting's share card, rendered on
+// demand (satori + resvg via workers-og, then JPEG or an H.264 loop) and never
+// stored: the edge cache absorbs repeats. The version lives in the path, not a
+// query string (some WhatsApp clients choke on queries in og:image), and the
+// server recomputes it from the record: stale or made-up versions redirect to
+// the canonical URL, so the cache only ever holds one entry per meeting per
+// format and probing cannot force re-renders, while a real edit (new title or
+// time) is a new URL to crawlers.
 async function shareCard(request, env, ctx, rest) {
-  const m = rest.match(/^([^.]+?)(?:\.([0-9a-f]{8,16}))?\.(?:png|jpe?g)$/);
+  const m = rest.match(/^([^.]+?)(?:\.([0-9a-f]{8,16}))?\.(png|jpe?g|mp4)$/);
   if (!m || !CODE_RE.test(m[1])) return json({ error: "Not found" }, 404);
   const code = m[1];
+  const ext = m[3] === "mp4" ? "mp4" : "jpg";
 
   const room = await env.ROOMS.get("room:" + code, { type: "json", cacheTtl: KV_CACHE_TTL });
   // Unknown or expired: hand crawlers the generic brand image instead of a 404.
   if (!room) return Response.redirect(new URL("/brand/social-1200.jpg", request.url), 302);
 
   const ver = await cardVersion(room);
-  const canonical = new URL("/og/" + code + "." + ver + ".jpg", request.url);
+  const canonical = new URL("/og/" + code + "." + ver + "." + ext, request.url);
   if (m[2] !== ver) return Response.redirect(canonical, 302);
 
   const key = new Request(canonical);
   let res = await caches.default.match(key);
   if (!res) {
-    res = await renderCard(env, room);
+    res = ext === "mp4" ? await renderVideo(env, room) : await renderCard(env, room);
     ctx.waitUntil(caches.default.put(key, res.clone()));
   }
   return request.method === "HEAD" ? new Response(null, res) : res;
@@ -701,7 +725,8 @@ async function loadCardAssets(env) {
 const cardText = (s) =>
   s.replace(/[^\x20-\x7E -ſ–—‘’“”•…·€™]/g, "").trim();
 
-async function renderCard(env, room) {
+// The 1200x630 card as raw RGBA — the JPEG and the video both start here.
+async function cardPixels(env, room) {
   if (!cardAssets) cardAssets = loadCardAssets(env).catch((e) => ((cardAssets = null), Promise.reject(e)));
   const assets = await cardAssets;
 
@@ -729,19 +754,150 @@ async function renderCard(env, room) {
   </div>`;
 
   const img = new ImageResponse(html, { width: 1200, height: 630, fonts: assets.fonts });
-  // resvg only speaks PNG; decode it and re-encode as JPEG so WhatsApp-sized
-  // limits are met. The buffered body also gives crawlers a Content-Length.
+  // resvg only speaks PNG; hand back its pixels for the JPEG or video encoder.
   const png = UPNG.decode(await img.arrayBuffer());
-  const rgba = new Uint8Array(UPNG.toRGBA8(png)[0]);
-  const out = jpeg.encode({ data: rgba, width: png.width, height: png.height }, CARD_JPEG_Q).data;
-  return new Response(out, {
-    headers: {
-      "Content-Type": "image/jpeg",
-      // A day for crawlers; immutable is honest because edits change the URL.
-      "Cache-Control": "public, max-age=86400, immutable",
-      "X-Robots-Tag": "noindex",
-    },
-  });
+  return { rgba: new Uint8Array(UPNG.toRGBA8(png)[0]), w: png.width, h: png.height };
+}
+
+// A day for crawlers; immutable is honest because edits change the URL. The
+// buffered bodies also give crawlers a Content-Length.
+const CARD_HEADERS = {
+  "Cache-Control": "public, max-age=86400, immutable",
+  "X-Robots-Tag": "noindex",
+};
+
+async function renderCard(env, room) {
+  const { rgba, w, h } = await cardPixels(env, room);
+  const out = jpeg.encode({ data: rgba, width: w, height: h }, CARD_JPEG_Q).data;
+  return new Response(out, { headers: { "Content-Type": "image/jpeg", ...CARD_HEADERS } });
+}
+
+// The video card: VID.frames of the card pixels with three scripted effects —
+// a seamless slow zoom, one diagonal light sweep per loop, and hovering bokeh
+// lights — encoded as baseline H.264. Costs a couple of CPU-seconds once per
+// meeting per edge, then lives in the cache exactly like the JPEG.
+async function renderVideo(env, room) {
+  const { rgba: src, w: sw, h: sh } = await cardPixels(env, room);
+  const enc = await hme.createH264MP4Encoder();
+  enc.width = VID.w;
+  enc.height = VID.h;
+  enc.frameRate = VID.fps;
+  enc.quantizationParameter = VID.qp;
+  enc.speed = 8;
+  enc.groupOfPictures = 24;
+  enc.initialize();
+
+  const frame = new Uint8Array(VID.w * VID.h * 4);
+  for (let i = 0; i < VID.frames; i++) {
+    composeFrame(frame, src, sw, sh, i / VID.frames);
+    enc.addFrameRgba(frame);
+  }
+  enc.finalize();
+  const mp4 = enc.FS.readFile(enc.outputFilename);
+  enc.delete();
+  return new Response(mp4, { headers: { "Content-Type": "video/mp4", ...CARD_HEADERS } });
+}
+
+// Every effect below is periodic in t ∈ [0,1), so the clip loops seamlessly.
+function composeFrame(dst, src, sw, sh, t) {
+  const W = VID.w, H = VID.h;
+  const wave = (1 - Math.cos(2 * Math.PI * t)) / 2; // 0 → 1 → 0
+  const s = 1 + 0.05 * wave;
+  const cx = sw * (0.5 + 0.012 * Math.sin(2 * Math.PI * t));
+  const winW = sw / s, winH = sh / s;
+  const x0 = cx - winW / 2, y0 = (sh - winH) / 2;
+  const stepX = winW / W, stepY = winH / H;
+
+  // Base layer: bilinear sample of the zoom window (column map precomputed).
+  const ix = new Int32Array(W), fx = new Float32Array(W);
+  for (let x = 0; x < W; x++) {
+    const v = Math.min(Math.max(x0 + (x + 0.5) * stepX - 0.5, 0), sw - 1.001);
+    ix[x] = v | 0;
+    fx[x] = v - ix[x];
+  }
+  for (let y = 0; y < H; y++) {
+    const v = Math.min(Math.max(y0 + (y + 0.5) * stepY - 0.5, 0), sh - 1.001);
+    const iy = v | 0, fy = v - iy;
+    const r0 = iy * sw, r1 = r0 + sw;
+    for (let x = 0; x < W; x++) {
+      const a = (r0 + ix[x]) * 4, b = (r1 + ix[x]) * 4, gx = fx[x];
+      const o = (y * W + x) * 4;
+      for (let c = 0; c < 3; c++) {
+        const top = src[a + c] + (src[a + 4 + c] - src[a + c]) * gx;
+        const bot = src[b + c] + (src[b + 4 + c] - src[b + c]) * gx;
+        dst[o + c] = top + (bot - top) * fy;
+      }
+      dst[o + 3] = 255;
+    }
+  }
+  sheen(dst, t);
+  bokeh(dst, t);
+}
+
+// One soft diagonal highlight sweeping across per loop, off-screen at t=0 and
+// t=1 so the loop point is invisible.
+function sheen(dst, t) {
+  const W = VID.w, H = VID.h;
+  const bh = 0.13;
+  const pos = -0.25 + 1.5 * t;
+  const inv = 1 / (W + 0.55 * H);
+  for (let y = 0; y < H; y++) {
+    let d = 0.55 * y * inv - pos;
+    for (let x = 0; x < W; x++, d += inv) {
+      if (d < -bh || d > bh) continue;
+      const k = 1 - (d * d) / (bh * bh);
+      const add = 70 * k * k;
+      const o = (y * W + x) * 4;
+      dst[o] = Math.min(255, dst[o] + add);
+      dst[o + 1] = Math.min(255, dst[o + 1] + add);
+      dst[o + 2] = Math.min(255, dst[o + 2] + add);
+    }
+  }
+}
+
+// Soft glow disc, built once; quartic falloff so there is no hard rim.
+const SPRITE_R = 26;
+const SPRITE = (() => {
+  const d = SPRITE_R * 2, s = new Uint8Array(d * d);
+  for (let y = 0; y < d; y++)
+    for (let x = 0; x < d; x++) {
+      const q = 1 - ((x - SPRITE_R) ** 2 + (y - SPRITE_R) ** 2) / (SPRITE_R * SPRITE_R);
+      if (q > 0) s[y * d + x] = 255 * q * q;
+    }
+  return s;
+})();
+
+// Accent-tinted lights hovering over the photo band, drifting on small
+// circles and pulsing — string-light bokeh to match the brand photo.
+const DOTS = [
+  { x: 0.14, y: 0.72, ph: 0.1, k: 0.9 },
+  { x: 0.38, y: 0.86, ph: 0.55, k: 0.6 },
+  { x: 0.63, y: 0.68, ph: 0.3, k: 0.75 },
+  { x: 0.87, y: 0.8, ph: 0.8, k: 0.5 },
+];
+function bokeh(dst, t) {
+  const W = VID.w, H = VID.h, d = SPRITE_R * 2;
+  for (const dot of DOTS) {
+    const ang = 2 * Math.PI * (t + dot.ph);
+    const cxp = (dot.x * W + 10 * Math.cos(ang)) | 0;
+    const cyp = (dot.y * H + 6 * Math.sin(ang)) | 0;
+    const g = dot.k * (0.35 + 0.3 * Math.sin(ang));
+    if (g <= 0) continue;
+    for (let sy = 0; sy < d; sy++) {
+      const py = cyp - SPRITE_R + sy;
+      if (py < 0 || py >= H) continue;
+      for (let sx = 0; sx < d; sx++) {
+        const a = SPRITE[sy * d + sx] * g;
+        if (!a) continue;
+        const px = cxp - SPRITE_R + sx;
+        if (px < 0 || px >= W) continue;
+        const o = (py * W + px) * 4;
+        dst[o] = Math.min(255, dst[o] + a * 0.85);
+        dst[o + 1] = Math.min(255, dst[o + 1] + a * 0.99);
+        dst[o + 2] = Math.min(255, dst[o + 2] + a);
+      }
+    }
+  }
 }
 
 const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
