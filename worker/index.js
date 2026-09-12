@@ -79,7 +79,7 @@ const UPSTREAM_TIMEOUT = 10000;
 // Share cards. CARD_REV busts every cached card after a design change; the
 // rest of the version hash comes from the record (title / schedule), so an
 // edited meeting is a brand-new image URL to crawlers that cached the old one.
-const CARD_REV = 3;
+const CARD_REV = 4;
 // WhatsApp silently drops preview images much over ~300 KB (Telegram and
 // Facebook allow megabytes), so the card ships as JPEG at this quality —
 // the photo band lands near 200 KB where the same pixels as PNG were 650 KB.
@@ -628,19 +628,24 @@ async function personaliseShell(request, env, res) {
     rw.on(`meta[name="${k}"]`, put);
   }
   // The shell carries no og:video tags to rewrite, so the animated card is
-  // appended here. Platforms that ignore it keep using og:image above.
-  const vid = origin + "/og/" + code + "." + ver + ".mp4";
-  rw.on("head", {
-    element: (e) =>
-      e.append(
-        `<meta property="og:video" content="${vid}" />` +
-          `<meta property="og:video:secure_url" content="${vid}" />` +
-          `<meta property="og:video:type" content="video/mp4" />` +
-          `<meta property="og:video:width" content="${VID.w}" />` +
-          `<meta property="og:video:height" content="${VID.h}" />`,
-        { html: true }
-      ),
-  });
+  // appended here — but only for crawlers known to play it. WhatsApp drops
+  // the WHOLE preview when og:video is present (it cannot thumbnail the mp4
+  // and gives up rather than fall back), so everyone not on this list gets
+  // the image-only tags that work everywhere.
+  if (/telegrambot|discordbot/i.test(request.headers.get("User-Agent") || "")) {
+    const vid = origin + "/og/" + code + "." + ver + ".mp4";
+    rw.on("head", {
+      element: (e) =>
+        e.append(
+          `<meta property="og:video" content="${vid}" />` +
+            `<meta property="og:video:secure_url" content="${vid}" />` +
+            `<meta property="og:video:type" content="video/mp4" />` +
+            `<meta property="og:video:width" content="${VID.w}" />` +
+            `<meta property="og:video:height" content="${VID.h}" />`,
+          { html: true }
+        ),
+    });
+  }
   return rw.transform(res);
 }
 
@@ -793,9 +798,62 @@ async function renderVideo(env, room) {
     enc.addFrameRgba(frame);
   }
   enc.finalize();
-  const mp4 = enc.FS.readFile(enc.outputFilename);
+  const mp4 = faststart(enc.FS.readFile(enc.outputFilename));
   enc.delete();
   return new Response(mp4, { headers: { "Content-Type": "video/mp4", ...CARD_HEADERS } });
+}
+
+// minih264 writes the moov index after mdat; preview thumbnailers (Telegram's
+// included) and seeking need it up front. Move it behind ftyp and shift the
+// chunk-offset tables to match.
+function faststart(mp4) {
+  const dv = new DataView(mp4.buffer, mp4.byteOffset, mp4.byteLength);
+  const boxes = [];
+  for (let o = 0; o + 8 <= mp4.length; ) {
+    const size = dv.getUint32(o);
+    if (size < 8 || o + size > mp4.length) return mp4; // malformed; leave it
+    boxes.push({ o, size, t: String.fromCharCode(mp4[o + 4], mp4[o + 5], mp4[o + 6], mp4[o + 7]) });
+    o += size;
+  }
+  const ftyp = boxes[0];
+  const moov = boxes.find((b) => b.t === "moov");
+  const mdat = boxes.find((b) => b.t === "mdat");
+  if (!ftyp || ftyp.t !== "ftyp" || !moov || !mdat || moov.o < mdat.o) return mp4;
+
+  const out = new Uint8Array(mp4.length);
+  out.set(mp4.subarray(0, ftyp.size), 0);
+  out.set(mp4.subarray(moov.o, moov.o + moov.size), ftyp.size);
+  let w = ftyp.size + moov.size;
+  for (const b of boxes) {
+    if (b === ftyp || b === moov) continue;
+    out.set(mp4.subarray(b.o, b.o + b.size), w);
+    w += b.size;
+  }
+  // Chunk offsets are absolute positions inside mdat, which moved right by
+  // exactly moov.size — moov sat behind it and now sits in front.
+  patchChunkOffsets(out, ftyp.size, moov.size, moov.size);
+  return out;
+}
+
+function patchChunkOffsets(buf, at, size, delta) {
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const containers = new Set(["moov", "trak", "mdia", "minf", "stbl"]);
+  const walk = (o, end) => {
+    while (o + 8 <= end) {
+      const s = dv.getUint32(o);
+      if (s < 8) return;
+      const t = String.fromCharCode(buf[o + 4], buf[o + 5], buf[o + 6], buf[o + 7]);
+      if (containers.has(t)) walk(o + 8, o + s);
+      else if (t === "stco")
+        for (let n = dv.getUint32(o + 12), i = 0; i < n; i++)
+          dv.setUint32(o + 16 + i * 4, dv.getUint32(o + 16 + i * 4) + delta);
+      else if (t === "co64")
+        for (let n = dv.getUint32(o + 12), i = 0; i < n; i++)
+          dv.setBigUint64(o + 16 + i * 8, dv.getBigUint64(o + 16 + i * 8) + BigInt(delta));
+      o += s;
+    }
+  };
+  walk(at + 8, at + size);
 }
 
 // Every effect below is periodic in t ∈ [0,1), so the clip loops seamlessly.
